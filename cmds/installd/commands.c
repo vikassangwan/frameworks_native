@@ -1,16 +1,16 @@
 /*
 ** Copyright 2008, The Android Open Source Project
 **
-** Licensed under the Apache License, Version 2.0 (the "License"); 
-** you may not use this file except in compliance with the License. 
-** You may obtain a copy of the License at 
+** Licensed under the Apache License, Version 2.0 (the "License");
+** you may not use this file except in compliance with the License.
+** You may obtain a copy of the License at
 **
-**     http://www.apache.org/licenses/LICENSE-2.0 
+**     http://www.apache.org/licenses/LICENSE-2.0
 **
-** Unless required by applicable law or agreed to in writing, software 
-** distributed under the License is distributed on an "AS IS" BASIS, 
-** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. 
-** See the License for the specific language governing permissions and 
+** Unless required by applicable law or agreed to in writing, software
+** distributed under the License is distributed on an "AS IS" BASIS,
+** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+** See the License for the specific language governing permissions and
 ** limitations under the License.
 */
 
@@ -558,9 +558,9 @@ int create_cache_path(char path[PKG_PATH_MAX], const char *src)
         return -1;
     }
 
-    dstlen = srclen + strlen(DALVIK_CACHE_PREFIX) + 
+    dstlen = srclen + strlen(DALVIK_CACHE_PREFIX) +
         strlen(DALVIK_CACHE_POSTFIX) + 1;
-    
+
     if (dstlen > PKG_PATH_MAX) {
         return -1;
     }
@@ -569,7 +569,7 @@ int create_cache_path(char path[PKG_PATH_MAX], const char *src)
             DALVIK_CACHE_PREFIX,
             src + 1, /* skip the leading / */
             DALVIK_CACHE_POSTFIX);
-    
+
     for(tmp = path + strlen(DALVIK_CACHE_PREFIX); *tmp; tmp++) {
         if (*tmp == '/') {
             *tmp = '@';
@@ -619,14 +619,11 @@ static void run_dex2oat(int zip_fd, int oat_fd, const char* input_file_name,
     ALOGE("execl(%s) failed: %s\n", DEX2OAT_BIN, strerror(errno));
 }
 
-static int wait_dexopt(pid_t pid, const char* apk_path)
+static int wait_child(pid_t pid)
 {
     int status;
     pid_t got_pid;
 
-    /*
-     * Wait for the optimization process to finish.
-     */
     while (1) {
         got_pid = waitpid(pid, &status, 0);
         if (got_pid == -1 && errno == EINTR) {
@@ -642,11 +639,8 @@ static int wait_dexopt(pid_t pid, const char* apk_path)
     }
 
     if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-        ALOGV("DexInv: --- END '%s' (success) ---\n", apk_path);
         return 0;
     } else {
-        ALOGW("DexInv: --- END '%s' --- status=0x%04x, process failed\n",
-            apk_path, status);
         return status;      /* always nonzero */
     }
 }
@@ -748,9 +742,11 @@ int dexopt(const char *apk_path, uid_t uid, int is_public)
         }
         exit(68);   /* only get here on exec failure */
     } else {
-        res = wait_dexopt(pid, apk_path);
-        if (res != 0) {
-            ALOGE("dexopt in='%s' out='%s' res=%d\n", apk_path, out_path, res);
+        res = wait_child(pid);
+        if (res == 0) {
+            ALOGV("DexInv: --- END '%s' (success) ---\n", apk_path);
+        } else {
+            ALOGE("DexInv: --- END '%s' --- status=0x%04x, process failed\n", apk_path, res);
             goto fail;
         }
     }
@@ -804,12 +800,12 @@ int movefileordir(char* srcpath, char* dstpath, int dstbasepos,
 
     int srcend = strlen(srcpath);
     int dstend = strlen(dstpath);
-    
+
     if (lstat(srcpath, statbuf) < 0) {
         ALOGW("Unable to stat %s: %s\n", srcpath, strerror(errno));
         return 1;
     }
-    
+
     if ((statbuf->st_mode&S_IFDIR) == 0) {
         mkinnerdirs(dstpath, dstbasepos, S_IRWXU|S_IRWXG|S_IXOTH,
                 dstuid, dstgid, statbuf);
@@ -835,7 +831,7 @@ int movefileordir(char* srcpath, char* dstpath, int dstbasepos,
     }
 
     res = 0;
-    
+
     while ((de = readdir(d))) {
         const char *name = de->d_name;
             /* always skip "." and ".." */
@@ -843,32 +839,32 @@ int movefileordir(char* srcpath, char* dstpath, int dstbasepos,
             if (name[1] == 0) continue;
             if ((name[1] == '.') && (name[2] == 0)) continue;
         }
-        
+
         if ((srcend+strlen(name)) >= (PKG_PATH_MAX-2)) {
             ALOGW("Source path too long; skipping: %s/%s\n", srcpath, name);
             continue;
         }
-        
+
         if ((dstend+strlen(name)) >= (PKG_PATH_MAX-2)) {
             ALOGW("Destination path too long; skipping: %s/%s\n", dstpath, name);
             continue;
         }
-        
+
         srcpath[srcend] = dstpath[dstend] = '/';
         strcpy(srcpath+srcend+1, name);
         strcpy(dstpath+dstend+1, name);
-        
+
         if (movefileordir(srcpath, dstpath, dstbasepos, dstuid, dstgid, statbuf) != 0) {
             res = 1;
         }
-        
+
         // Note: we will be leaving empty directories behind in srcpath,
         // but that is okay, the package manager will be erasing all of the
         // data associated with .apks that disappear.
-        
+
         srcpath[srcend] = dstpath[dstend] = 0;
     }
-    
+
     closedir(d);
     return res;
 }
@@ -910,7 +906,7 @@ int movefiles()
                         UPDATE_COMMANDS_DIR_PREFIX, name);
                 continue;
             }
-            
+
             bufp = 0;
             bufe = 0;
             buf[PKG_PATH_MAX] = 0;
@@ -1103,4 +1099,116 @@ out:
     }
 
     return rc;
+}
+
+static void run_idmap(const char *target_apk, const char *overlay_apk, int idmap_fd)
+{
+    static const char *IDMAP_BIN = "/system/bin/idmap";
+    static const size_t MAX_INT_LEN = 32;
+    char idmap_str[MAX_INT_LEN];
+
+    snprintf(idmap_str, sizeof(idmap_str), "%d", idmap_fd);
+
+    execl(IDMAP_BIN, IDMAP_BIN, "--fd", target_apk, overlay_apk, idmap_str, (char*)NULL);
+    ALOGE("execl(%s) failed: %s\n", IDMAP_BIN, strerror(errno));
+}
+
+// Transform string /a/b/c.apk to (prefix)/a@b@c.apk@(suffix)
+// eg /a/b/c.apk to /data/resource-cache/a@b@c.apk@idmap
+static int flatten_path(const char *prefix, const char *suffix,
+        const char *overlay_path, char *idmap_path, size_t N)
+{
+    if (overlay_path == NULL || idmap_path == NULL) {
+        return -1;
+    }
+    const size_t len_overlay_path = strlen(overlay_path);
+    // will access overlay_path + 1 further below; requires absolute path
+    if (len_overlay_path < 2 || *overlay_path != '/') {
+        return -1;
+    }
+    const size_t len_idmap_root = strlen(prefix);
+    const size_t len_suffix = strlen(suffix);
+    if (SIZE_MAX - len_idmap_root < len_overlay_path ||
+            SIZE_MAX - (len_idmap_root + len_overlay_path) < len_suffix) {
+        // additions below would cause overflow
+        return -1;
+    }
+    if (N < len_idmap_root + len_overlay_path + len_suffix) {
+        return -1;
+    }
+    memset(idmap_path, 0, N);
+    snprintf(idmap_path, N, "%s%s%s", prefix, overlay_path + 1, suffix);
+    char *ch = idmap_path + len_idmap_root;
+    while (*ch != '\0') {
+        if (*ch == '/') {
+            *ch = '@';
+        }
+        ++ch;
+    }
+    return 0;
+}
+
+int idmap(const char *target_apk, const char *overlay_apk, uid_t uid)
+{
+    ALOGV("idmap target_apk=%s overlay_apk=%s uid=%d\n", target_apk, overlay_apk, uid);
+
+    int idmap_fd = -1;
+    char idmap_path[PATH_MAX];
+
+    if (flatten_path(IDMAP_PREFIX, IDMAP_SUFFIX, overlay_apk,
+                idmap_path, sizeof(idmap_path)) == -1) {
+        ALOGE("idmap cannot generate idmap path for overlay %s\n", overlay_apk);
+        goto fail;
+    }
+
+    unlink(idmap_path);
+    idmap_fd = open(idmap_path, O_RDWR | O_CREAT | O_EXCL, 0644);
+    if (idmap_fd < 0) {
+        ALOGE("idmap cannot open '%s' for output: %s\n", idmap_path, strerror(errno));
+        goto fail;
+    }
+    if (fchown(idmap_fd, AID_SYSTEM, uid) < 0) {
+        ALOGE("idmap cannot chown '%s'\n", idmap_path);
+        goto fail;
+    }
+    if (fchmod(idmap_fd, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) < 0) {
+        ALOGE("idmap cannot chmod '%s'\n", idmap_path);
+        goto fail;
+    }
+
+    pid_t pid;
+    pid = fork();
+    if (pid == 0) {
+        /* child -- drop privileges before continuing */
+        if (setgid(uid) != 0) {
+            ALOGE("setgid(%d) failed during idmap\n", uid);
+            exit(1);
+        }
+        if (setuid(uid) != 0) {
+            ALOGE("setuid(%d) failed during idmap\n", uid);
+            exit(1);
+        }
+        if (flock(idmap_fd, LOCK_EX | LOCK_NB) != 0) {
+            ALOGE("flock(%s) failed during idmap: %s\n", idmap_path, strerror(errno));
+            exit(1);
+        }
+
+        run_idmap(target_apk, overlay_apk, idmap_fd);
+        exit(1); /* only if exec call to idmap failed */
+    } else {
+        int status = wait_child(pid);
+        if (status != 0) {
+            ALOGE("idmap failed, status=0x%04x\n", status);
+            goto fail;
+        }
+    }
+
+    close(idmap_fd);
+    return 0;
+fail:
+    if (idmap_fd >= 0) {
+        close(idmap_fd);
+        unlink(idmap_path);
+    }
+    return -1;
 }

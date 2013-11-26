@@ -1,16 +1,16 @@
 /*
 ** Copyright 2008, The Android Open Source Project
 **
-** Licensed under the Apache License, Version 2.0 (the "License"); 
-** you may not use this file except in compliance with the License. 
-** You may obtain a copy of the License at 
+** Licensed under the Apache License, Version 2.0 (the "License");
+** you may not use this file except in compliance with the License.
+** You may obtain a copy of the License at
 **
-**     http://www.apache.org/licenses/LICENSE-2.0 
+**     http://www.apache.org/licenses/LICENSE-2.0
 **
-** Unless required by applicable law or agreed to in writing, software 
-** distributed under the License is distributed on an "AS IS" BASIS, 
-** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. 
-** See the License for the specific language governing permissions and 
+** Unless required by applicable law or agreed to in writing, software
+** distributed under the License is distributed on an "AS IS" BASIS,
+** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+** See the License for the specific language governing permissions and
 ** limitations under the License.
 */
 
@@ -121,6 +121,11 @@ static int do_linklib(char **arg, char reply[REPLY_MAX])
     return linklib(arg[0], arg[1], atoi(arg[2]));
 }
 
+static int do_idmap(char **arg, char reply[REPLY_MAX])
+{
+    return idmap(arg[0], arg[1], atoi(arg[2]));
+}
+
 struct cmdinfo {
     const char *name;
     unsigned numargs;
@@ -144,6 +149,7 @@ struct cmdinfo cmds[] = {
     { "linklib",              3, do_linklib },
     { "mkuserdata",           3, do_mk_user_data },
     { "rmuser",               1, do_rm_user },
+    { "idmap",                3, do_idmap },
 };
 
 char write_error = 0;
@@ -559,6 +565,7 @@ static void drop_privileges() {
     capdata[CAP_TO_INDEX(CAP_CHOWN)].permitted        |= CAP_TO_MASK(CAP_CHOWN);
     capdata[CAP_TO_INDEX(CAP_SETUID)].permitted       |= CAP_TO_MASK(CAP_SETUID);
     capdata[CAP_TO_INDEX(CAP_SETGID)].permitted       |= CAP_TO_MASK(CAP_SETGID);
+    capdata[CAP_TO_INDEX(CAP_FOWNER)].permitted       |= CAP_TO_MASK(CAP_FOWNER);
 
     capdata[0].effective = capdata[0].permitted;
     capdata[1].effective = capdata[1].permitted;
