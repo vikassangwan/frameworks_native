@@ -68,6 +68,7 @@ Layer::Layer(SurfaceFlinger* flinger, const sp<Client>& client,
         mDebug(false),
         mFormat(PIXEL_FORMAT_NONE),
         mOpaqueLayer(true),
+        mNeedsDithering(false),
         mTransactionFlags(0),
         mQueuedFrames(0),
         mCurrentTransform(0),
@@ -81,12 +82,14 @@ Layer::Layer(SurfaceFlinger* flinger, const sp<Client>& client,
         mSecure(false),
         mProtectedByApp(false),
         mHasSurface(false),
-        mClientRef(client)
+        mClientRef(client),
+        mDirtyRectRepeatCount(0)
 {
     mCurrentCrop.makeInvalid();
     mFlinger->getRenderEngine().genTextures(1, &mTextureName);
     mTexture.init(Texture::TEXTURE_EXTERNAL, mTextureName);
-
+    Rect x(0,0,0,0);
+    mSwapDirtyRect.set(x);
     uint32_t layerFlags = 0;
     if (flags & ISurfaceComposerClient::eHidden)
         layerFlags = layer_state_t::eLayerHidden;
@@ -199,6 +202,12 @@ status_t Layer::setBuffers( uint32_t w, uint32_t h,
     mSurfaceFlingerConsumer->setDefaultBufferFormat(format);
     mSurfaceFlingerConsumer->setConsumerUsageBits(getEffectiveUsage(0));
 
+    if (mFlinger->getUseDithering()) {
+        int displayMinColorDepth = mFlinger->getMinColorDepth();
+        int layerMinColorDepth = minColorDepth(format);
+        mNeedsDithering = (layerMinColorDepth > displayMinColorDepth);
+    }
+
     return NO_ERROR;
 }
 
@@ -259,7 +268,9 @@ static Rect reduce(const Rect& win, const Region& exclude) {
     if (CC_LIKELY(exclude.isEmpty())) {
         return win;
     }
-    if (exclude.isRect()) {
+    Rect tmp;
+    win.intersect(exclude.getBounds(), &tmp);
+    if (exclude.isRect() && !tmp.isEmpty()) {
         return win.reduce(exclude.getBounds());
     }
     return Region(win).subtract(exclude).getBounds();
@@ -573,6 +584,7 @@ void Layer::clearWithOpenGL(const sp<const DisplayDevice>& hw, const Region& cli
 {
     RenderEngine& engine(mFlinger->getRenderEngine());
     computeGeometry(hw, mMesh);
+    engine.setDither(false);
     engine.setupFillWithColor(red, green, blue, alpha);
     engine.drawMesh(mMesh);
 }
@@ -619,6 +631,7 @@ void Layer::drawWithOpenGL(
     texCoords[3] = vec2(right, 1.0f - top);
 
     RenderEngine& engine(mFlinger->getRenderEngine());
+    engine.setDither(needsDithering());
     engine.setupLayerBlending(mPremultipliedAlpha, isOpaque(), s.alpha);
     engine.drawMesh(mMesh);
     engine.disableBlending();
@@ -1155,8 +1168,75 @@ Region Layer::latchBuffer(bool& recomputeVisibleRegions)
 
         // transform the dirty region to window-manager space
         outDirtyRegion = (s.transform.transform(dirtyRegion));
-    }
+        Rect dirtyRect;
+        mSurfaceFlingerConsumer->getDirtyRegion(dirtyRect);
+        if (dirtyRect == mSwapDirtyRect) {
+            mDirtyRectRepeatCount++;
+        } else {
+            mDirtyRectRepeatCount=0;
+            mSwapDirtyRect = dirtyRect;
+        }
+
+    } else {
+        if (mSwapDirtyRect.isEmpty()) {
+            mDirtyRectRepeatCount++;
+        } else {
+            mDirtyRectRepeatCount=0;
+            mSwapDirtyRect.clear();
+        }
+   }
     return outDirtyRegion;
+}
+
+bool Layer::canUseSwapRect(Region& consolidateVisibleRegion,
+                                             Rect& dirtyRect,
+                           const sp<const DisplayDevice>& hw ) const {
+    //Disable SwapRect for non-RGB layers
+#ifdef QCOM_BSP
+    const sp<GraphicBuffer>& activeBuffer(mActiveBuffer);
+    if(activeBuffer != 0) {
+        ANativeWindowBuffer* buffer = activeBuffer->getNativeBuffer();
+        if(buffer) {
+            private_handle_t* hnd = static_cast<private_handle_t*>
+                              (const_cast<native_handle_t*>(buffer->handle));
+            //if BUFFER_TYPE_VIDEO, its YUV
+             if (hnd && (hnd->bufferType == BUFFER_TYPE_VIDEO))
+                 return  false;
+        }
+    }
+#endif
+    //Enable SwapRect only if all the buffers for this
+    //Layer contains same DirtyRect
+    if (mDirtyRectRepeatCount <= BufferQueue::MIN_UNDEQUEUED_BUFFERS) {
+        return false;
+    }
+    //If there are any overlapping visible regions, disable SwapRect
+    if (!consolidateVisibleRegion.intersect(visibleRegion).isEmpty()) {
+        return false;
+    }
+    consolidateVisibleRegion.orSelf(visibleRegion);
+    //Disable SwapRect if the source crop and destination crop are
+    //same
+    const State& s(getDrawingState());
+    Rect frame(s.transform.transform(computeBounds()));
+    frame.intersect(hw->getViewport(), &frame);
+    const Transform& tr(hw->getTransform());
+    frame = tr.transform(frame);
+    FloatRect displayCrop(frame);
+    FloatRect sourceCrop(computeCrop(hw));
+    if ((displayCrop.left   != sourceCrop.left)  ||
+        (displayCrop.top    != sourceCrop.top)   ||
+        (displayCrop.right  != sourceCrop.right) ||
+        (displayCrop.bottom != sourceCrop.bottom) ){
+         return false;
+    }
+    dirtyRect = mSwapDirtyRect;
+    return true;
+}
+
+void Layer::resetSwapRect() {
+       mDirtyRectRepeatCount = 0;
+       mSwapDirtyRect.clear();
 }
 
 uint32_t Layer::getEffectiveUsage(uint32_t usage) const

@@ -77,9 +77,18 @@
 
 #include "RenderEngine/RenderEngine.h"
 #include <cutils/compiler.h>
+#if defined(ENABLE_SWAPRECT) && defined(QCOM_BSP)
+#include "cb_swap_rect.h"
+#endif
 
 #ifdef SAMSUNG_HDMI_SUPPORT
 #include "SecTVOutService.h"
+#endif
+
+#ifdef ENABLE_SWAPRECT
+#define SWAPRECT_DEFAULT "1"
+#else
+#define SWAPRECT_DEFAULT "0"
 #endif
 
 #define DISPLAY_COUNT       1
@@ -157,6 +166,7 @@ SurfaceFlinger::SurfaceFlinger()
         mDebugInTransaction(0),
         mLastTransactionTime(0),
         mBootFinished(false),
+        mUseDithering(false),
         mPrimaryHWVsyncEnabled(false),
         mHWVsyncAvailable(false),
         mDaltonize(false)
@@ -192,6 +202,8 @@ SurfaceFlinger::SurfaceFlinger()
 #endif
 #endif
 
+    property_get("debug.sf.swaprect", value, SWAPRECT_DEFAULT);
+    mSwapRectEnable = atoi(value) ? true:false ;
 }
 
 void SurfaceFlinger::onFirstRef()
@@ -573,6 +585,9 @@ void SurfaceFlinger::init() {
     ALOGI("Client API: %s", eglQueryString(mEGLDisplay, EGL_CLIENT_APIS)?:"Not Supported");
     ALOGI("EGLSurface: %d-%d-%d-%d, config=%p", r, g, b, a, mEGLConfig);
 
+    // assume red has minimum color depth
+    mMinColorDepth = r;
+
     // get a RenderEngine for the given display / config (can't fail)
     mRenderEngine = RenderEngine::create(mEGLDisplay, mEGLConfig);
 
@@ -610,6 +625,9 @@ void SurfaceFlinger::init() {
                 hw->acquireScreen();
             }
             mDisplays.add(token, hw);
+            if (!mUseDithering && bitsPerPixel(mHwc->getFormat(i)) <= 16) {
+                mUseDithering = true;
+            }
         }
     }
 
@@ -1169,6 +1187,8 @@ void SurfaceFlinger::setUpHWComposer() {
             sp<const DisplayDevice> hw(mDisplays[dpy]);
             hw->prepareFrame(hwc);
         }
+        // set up for swaprect
+        setupSwapRect();
     }
 }
 
@@ -1295,6 +1315,76 @@ void SurfaceFlinger::setVirtualDisplayData(
     mHwc->setVirtualDisplayProperties(hwcDisplayId, w, h, format);
 }
 
+void SurfaceFlinger::configureVirtualDisplay(int32_t &hwcDisplayId,
+                                        sp<DisplaySurface> &dispSurface,
+                                        sp<IGraphicBufferProducer> &producer,
+                                        const DisplayDeviceState state,
+                                        sp<BufferQueue> bq)
+{
+    bool vdsEnabled = mHwc->isVDSEnabled();
+
+    //for V4L2 based virtual display implementation
+    if(!vdsEnabled) {
+        // persist.sys.wfd.virtual will be set if WFD is launched via
+        // settings app. This is currently being done in
+        // ExtendedRemoteDisplay-WFD stack.
+        // This flag will be reset at the time of disconnection of virtual WFD
+        // display.
+        // This flag is set to zero if WFD is launched via QCOM WFD
+        // proprietary APIs which use HDMI piggyback approach.
+        char value[PROPERTY_VALUE_MAX];
+        property_get("persist.sys.wfd.virtual", value, "0");
+        int wfdVirtual = atoi(value);
+        if(!wfdVirtual) {
+            // This is for non-wfd virtual display scenarios(e.g. SSD/SR/CTS)
+            sp<VirtualDisplaySurface> vds = new VirtualDisplaySurface(*mHwc,
+                    hwcDisplayId, state.surface, bq, state.displayName);
+            dispSurface = vds;
+            // There won't be any interaction with HWC for this virtual display.
+            // so the GLES driver can pass buffers directly to the sink.
+            producer = state.surface;
+        } else {
+            hwcDisplayId = allocateHwcDisplayId(state.type);
+            if (hwcDisplayId >= 0) {
+                // This is for WFD virtual display scenario.
+                // Read virtual display properties and create a
+                // rendering surface for it inorder to be handled by hwc.
+                setVirtualDisplayData(hwcDisplayId, state.surface);
+                dispSurface = new FramebufferSurface(*mHwc, state.type, bq);
+                producer = bq;
+            } else {
+                // in case of WFD Virtual + SSD/SR concurrency scenario,
+                // WFD virtual display instance gets valid hwcDisplayId and
+                // SSD/SR will get invalid hwcDisplayId
+                sp<VirtualDisplaySurface> vds = new VirtualDisplaySurface(*mHwc,
+                        hwcDisplayId, state.surface, bq, state.displayName);
+                dispSurface = vds;
+                // There won't be any interaction with HWC for this virtual
+                // display, so the GLES driver can pass buffers directly to the
+                // sink.
+                producer = state.surface;
+            }
+        }
+    } else {
+        // VDS solution is enabled
+        // HWC is allocated for first virtual display.
+        // Subsequent virtual display sessions will be composed by GLES driver.
+        // ToDo: Modify VDS component to allocate hwcDisplayId based on
+        // mForceHwcCopy (which is based on Usage Flags)
+
+        sp<VirtualDisplaySurface> vds = new VirtualDisplaySurface(*mHwc,
+                hwcDisplayId, state.surface, bq, state.displayName);
+        dispSurface = vds;
+        if (hwcDisplayId >= 0) {
+            producer = vds;
+        } else {
+            // There won't be any interaction with HWC for this virtual display,
+            // so the GLES driver can pass buffers directly to the sink.
+            producer = state.surface;
+        }
+    }
+}
+
 void SurfaceFlinger::handleTransactionLocked(uint32_t transactionFlags)
 {
     const LayerVector& currentLayers(mCurrentState.layersSortedByZ);
@@ -1406,34 +1496,8 @@ void SurfaceFlinger::handleTransactionLocked(uint32_t transactionFlags)
                         // they have external state (layer stack, projection,
                         // etc.) but no internal state (i.e. a DisplayDevice).
                         if (state.surface != NULL) {
-
-                            char value[PROPERTY_VALUE_MAX];
-                            hwcDisplayId = allocateHwcDisplayId(state.type);
-                            property_get("persist.sys.wfd.virtual", value, "0");
-                            int wfdVirtual = atoi(value);
-                            if(!wfdVirtual) {
-                                sp<VirtualDisplaySurface> vds =
-                                              new VirtualDisplaySurface(
-                                    *mHwc, hwcDisplayId, state.surface, bq,
-                                    state.displayName);
-                                dispSurface = vds;
-                                if (hwcDisplayId >= 0) {
-                                   producer = vds;
-                                } else {
-                                  // There won't be any interaction with HWC for this virtual display,
-                                  // so the GLES driver can pass buffers directly to the sink.
-                                  producer = state.surface;
-                                }
-                            } else {
-                                //Read virtual display properties and create a
-                                //rendering surface for it inorder to be handled
-                                //by hwc.
-                                setVirtualDisplayData(hwcDisplayId,
-                                                                 state.surface);
-                                dispSurface = new FramebufferSurface(*mHwc,
-                                                                    state.type, bq);
-                                producer = bq;
-                            }
+                            configureVirtualDisplay(hwcDisplayId,
+                                    dispSurface, producer, state, bq);
                         }
                     } else {
                         ALOGE_IF(state.surface!=NULL,
@@ -2707,6 +2771,12 @@ void SurfaceFlinger::dumpAllLocked(const Vector<String16>& args, size_t& index,
             inTransactionDuration/1000.0);
 
     /*
+     * SWAPRECT state
+     */
+    result.appendFormat( "SWAPRECT state: %s\n",
+            mSwapRectEnable? "enabled":"disabled");
+
+    /*
      * VSYNC state
      */
     mEventThread->dump(result);
@@ -3376,6 +3446,69 @@ status_t SurfaceFlinger::captureScreen(const sp<IBinder>& display,
     return res;
 }
 #endif
+
+void SurfaceFlinger::setupSwapRect()
+{
+    /*
+    * Initialize hwc swaprect to false. It's set to true once we decide
+    * we're going to use Swaprect
+    */
+    HWComposer& hwc(getHwComposer());
+    const LayerVector& currentLayers(mDrawingState.layersSortedByZ);
+    size_t count = currentLayers.size();
+#if defined(ENABLE_SWAPRECT) && defined(QCOM_BSP)
+    qdutils::cb_swap_rect::getInstance().setSwapRectFeature_on(false);
+#endif
+    hwc.setSwapRectOn(false);
+    /*
+     * swap rect is enabled if swaprect property is set
+     * and it is blit composition
+     */
+    if (mSwapRectEnable && hwc.hasBlitComposition(HWC_DISPLAY_PRIMARY)) {
+        int  totalDirtyRects = 0;
+        Region consolidateVisibleRegion;
+        Rect swapDirtyRect(Rect(0,0,0,0));
+        /* This dirtyLayerIdx is also used to check if we're not going to use
+         * swaprect after iterating all layers
+         */
+        sp<const DisplayDevice> hw(mDisplays[HWC_DISPLAY_PRIMARY]);
+        int dirtyLayerIdx = -1;
+        for (size_t i=0 ; i<count ; i++) {
+           // even if one layer is not OK with SwapRect , dont enable it.
+            Rect dirtyRect(Rect(0,0,0,0));
+            if (!currentLayers[i]->visibleRegion.isEmpty()) {
+                 if (!currentLayers[i]->canUseSwapRect(
+                           consolidateVisibleRegion, dirtyRect,hw)) {
+                      return;
+                 }
+            }
+            if (!dirtyRect.isEmpty()) {
+                /*
+                 * Don't use SwapRect if there are more than one dirtyRects
+                 * TODO: should be removed once handling multiple dirtyRects
+                 * is added
+                 */
+                if (++totalDirtyRects > 1) return;
+                swapDirtyRect.set(dirtyRect);
+                dirtyLayerIdx = i;
+            }
+        }
+
+        //If SwapRect is enabled, dirtyLayerIdx would be set to the layer's idx
+        if(dirtyLayerIdx != -1)  {
+            /*
+             * Create dirty layer work list to be used by HWComposer instead of
+             * visible layer work list
+             */
+#if defined(ENABLE_SWAPRECT) && defined(QCOM_BSP)
+           qdutils::cb_swap_rect::getInstance().setSwapRectFeature_on(true);
+#endif
+            hwc.setSwapRectOn(true);
+            hwc.setSwapRect(swapDirtyRect);
+            invalidateHwcGeometry();
+        }
+   }
+}
 
 // ---------------------------------------------------------------------------
 
